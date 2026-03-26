@@ -1,4 +1,3 @@
-const fetch = require('node-fetch')
 const { backOff } = require('exponential-backoff')
 
 const CF_API_TOKEN = process.env.CF_API_TOKEN
@@ -8,9 +7,14 @@ const CF_DELETE_ALIASED_DEPLOYMENTS = process.env.CF_DELETE_ALIASED_DEPLOYMENTS
 
 const MAX_ATTEMPTS = 5
 
-const DEPLOYMENTS_PER_PAGE = 10
-const PAGINATION_BATCH_SIZE = 3
-const BATCH_MAX_RESULTS = PAGINATION_BATCH_SIZE*DEPLOYMENTS_PER_PAGE
+const DEPLOYMENTS_PER_PAGE = 25
+const PAGINATION_BATCH_SIZE = 4
+const BATCH_MAX_RESULTS = PAGINATION_BATCH_SIZE * DEPLOYMENTS_PER_PAGE
+
+// --- 配置常量 ---
+const DELAY_BETWEEN_CHUNKS_MS = 500
+const DELAY_BETWEEN_PAGES_MS = 500
+const DELETE_CONCURRENCY_LIMIT = 3 // 每次并发删除的数量
 
 const sleep = (ms) =>
   new Promise((resolve) => {
@@ -41,22 +45,41 @@ async function getProductionDeploymentId() {
   return prodDeploymentId
 }
 
+/** * Delete a specific deployment
+ * 增加了指数退避重试机制，以应对网络抖动或 API 限流 (HTTP 429)
+ */
 async function deleteDeployment(id) {
   let params = ''
   if (CF_DELETE_ALIASED_DEPLOYMENTS === 'true') {
     params = '?force=true' // Forces deletion of aliased deployments
   }
-  const response = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PAGES_PROJECT_NAME}/deployments/${id}${params}`,
+
+  await backOff(
+    async () => {
+      const response = await fetch(
+        `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PAGES_PROJECT_NAME}/deployments/${id}${params}`,
+        {
+          method: 'DELETE',
+          headers,
+        }
+      )
+      const body = await response.json()
+      if (!body.success) {
+        throw new Error(body.errors[0].message)
+      }
+    },
     {
-      method: 'DELETE',
-      headers,
+      numOfAttempts: MAX_ATTEMPTS,
+      startingDelay: 1000,
+      retry: (err, attempt) => {
+        console.warn(
+          `Failed to delete deployment ${id}... retrying (${attempt}/${MAX_ATTEMPTS}). Error: ${err.message}`
+        )
+        return true
+      },
     }
   )
-  const body = await response.json()
-  if (!body.success) {
-    throw new Error(body.errors[0].message)
-  }
+
   console.log(`Deleted deployment ${id} for project ${CF_PAGES_PROJECT_NAME}`)
 }
 
@@ -90,8 +113,8 @@ async function listNextDeployments() {
     let result
     try {
       result = await backOff(() => listDeploymentsPerPage(page), {
-        numOfAttempts: 5,
-        startingDelay: 1000, // 1s, 2s, 4s, 8s, 16s
+        numOfAttempts: MAX_ATTEMPTS,
+        startingDelay: 1000, 
         retry: (_, attempt) => {
           console.warn(
             `Failed to list deployments on page ${page}... retrying (${attempt}/${MAX_ATTEMPTS})`
@@ -102,7 +125,6 @@ async function listNextDeployments() {
     } catch (err) {
       console.warn(`Failed to list deployments on page ${page}.`)
       console.warn(err)
-
       process.exit(1)
     }
 
@@ -112,31 +134,43 @@ async function listNextDeployments() {
 
     if (result.length && (BATCH_MAX_RESULTS > page * DEPLOYMENTS_PER_PAGE)) {
       page = page + 1
-      await sleep(500)
+      await sleep(DELAY_BETWEEN_PAGES_MS)
     } else {
       return deploymentIds
     }
   }
 }
 
-async function deleteBatch(deploymentIds) {
-  const productionDeploymentId = await getProductionDeploymentId()
-  if (productionDeploymentId !== null) {
-    console.log(
-      `Found live production deployment to exclude from deletion: ${productionDeploymentId}`
-    )
-  }
-
-  for (const id of deploymentIds) {
+/** * 批量删除部署
+ * 采用分块并发 (Chunking Concurrency) 提升效率
+ */
+async function deleteBatch(deploymentIds, productionDeploymentId) {
+  // 过滤出真正需要删除的 ID
+  const idsToDelete = deploymentIds.filter((id) => {
     if (productionDeploymentId !== null && id === productionDeploymentId) {
       console.log(`Skipping production deployment: ${id}`)
-    } else {
-      try {
-        await deleteDeployment(id)
-        await sleep(500)
-      } catch (error) {
-        console.log(error)
-      }
+      return false
+    }
+    return true
+  })
+
+  // 以 DELETE_CONCURRENCY_LIMIT 为步长，对任务进行分块并发
+  for (let i = 0; i < idsToDelete.length; i += DELETE_CONCURRENCY_LIMIT) {
+    const chunk = idsToDelete.slice(i, i + DELETE_CONCURRENCY_LIMIT)
+
+    await Promise.allSettled(
+      chunk.map(async (id) => {
+        try {
+          await deleteDeployment(id)
+        } catch (error) {
+          console.error(`Final error deleting ${id}:`, error.message)
+        }
+      })
+    )
+
+    // 块与块之间进行延时，防止瞬间请求过多触发 API 速率限制
+    if (i + DELETE_CONCURRENCY_LIMIT < idsToDelete.length) {
+      await sleep(DELAY_BETWEEN_CHUNKS_MS)
     }
   }
 }
@@ -156,12 +190,22 @@ async function main() {
     )
   }
   
-  let deploymentIds = await listNextDeployments()
-  while(deploymentIds.length > 1) { // Ignoring live production deployment
-    await deleteBatch(deploymentIds)
-    deploymentIds = await listNextDeployments()
+  // 提取到循环外部：全局只获取一次当前生产环境的 ID
+  const productionDeploymentId = await getProductionDeploymentId()
+  if (productionDeploymentId !== null) {
+    console.log(
+      `Found live production deployment to exclude from deletion: ${productionDeploymentId}`
+    )
   }
 
+  let deploymentIds = await listNextDeployments()
+  while(deploymentIds.length > 1) {
+    // 将生产环境 ID 传递给删除逻辑
+    await deleteBatch(deploymentIds, productionDeploymentId)
+    deploymentIds = await listNextDeployments()
+  }
+  
+  console.log('Cleanup process finished.')
 }
 
 main()
