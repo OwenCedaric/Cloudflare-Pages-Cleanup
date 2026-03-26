@@ -142,10 +142,9 @@ async function listNextDeployments() {
 }
 
 /** * 批量删除部署
- * 采用分块并发 (Chunking Concurrency) 提升效率
+ * 返回成功删除的数量，用于判断是否应该继续循环
  */
 async function deleteBatch(deploymentIds, productionDeploymentId) {
-  // 过滤出真正需要删除的 ID
   const idsToDelete = deploymentIds.filter((id) => {
     if (productionDeploymentId !== null && id === productionDeploymentId) {
       console.log(`Skipping production deployment: ${id}`)
@@ -154,7 +153,8 @@ async function deleteBatch(deploymentIds, productionDeploymentId) {
     return true
   })
 
-  // 以 DELETE_CONCURRENCY_LIMIT 为步长，对任务进行分块并发
+  let successCount = 0; // Track successful deletions
+
   for (let i = 0; i < idsToDelete.length; i += DELETE_CONCURRENCY_LIMIT) {
     const chunk = idsToDelete.slice(i, i + DELETE_CONCURRENCY_LIMIT)
 
@@ -162,17 +162,20 @@ async function deleteBatch(deploymentIds, productionDeploymentId) {
       chunk.map(async (id) => {
         try {
           await deleteDeployment(id)
+          successCount++; // Increment on success
         } catch (error) {
-          console.error(`Final error deleting ${id}:`, error.message)
+          // Log but don't crash. This handles aliased deployments when force=false.
+          console.error(`Skipping ${id} (Failed to delete):`, error.message)
         }
       })
     )
 
-    // 块与块之间进行延时，防止瞬间请求过多触发 API 速率限制
     if (i + DELETE_CONCURRENCY_LIMIT < idsToDelete.length) {
       await sleep(DELAY_BETWEEN_CHUNKS_MS)
     }
   }
+  
+  return successCount; // Return the progress metric
 }
 
 async function main() {
@@ -190,7 +193,6 @@ async function main() {
     )
   }
   
-  // 提取到循环外部：全局只获取一次当前生产环境的 ID
   const productionDeploymentId = await getProductionDeploymentId()
   if (productionDeploymentId !== null) {
     console.log(
@@ -199,9 +201,18 @@ async function main() {
   }
 
   let deploymentIds = await listNextDeployments()
-  while(deploymentIds.length > 1) {
-    // 将生产环境 ID 传递给删除逻辑
-    await deleteBatch(deploymentIds, productionDeploymentId)
+  
+  // Changed from > 1 to > 0 to handle cases with only 1 leftover target
+  while(deploymentIds.length > 0) {
+    const deletedCount = await deleteBatch(deploymentIds, productionDeploymentId)
+    
+    // Progress Check: If we processed a batch but deleted nothing, 
+    // the remaining deployments are protected (aliased or production). Break the loop.
+    if (deletedCount === 0) {
+      console.log('No more deletable deployments found. Exiting smoothly.')
+      break;
+    }
+    
     deploymentIds = await listNextDeployments()
   }
   
