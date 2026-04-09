@@ -2,7 +2,7 @@ name: Cloudflare-Pages-Cleanup
 
 on:
   schedule:
-    - cron: '0 0 1 * *' # 每月 1 号 UTC 0:00
+    - cron: '3 3 3 * *' # 每月 3 号 UTC 3:03
   workflow_dispatch:
 
 jobs:
@@ -51,3 +51,29 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_PAGES_PROJECT_NAME: ${{ matrix.project }}
           CF_DELETE_ALIASED_DEPLOYMENTS: ${{ vars.CF_DELETE_ALIASED_DEPLOYMENTS }}
+
+  keep-alive:
+    needs: sync
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      
+      - name: Write Log and Push
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 切换到孤立的 logs 分支 (覆盖方式)
+          git checkout --orphan logs
+          
+          # 清除文件并写入最新日志
+          git rm -rf .
+          echo "Last Run: $(date -u)" > last_run.log
+          
+          # 提交并强制推送以覆盖 logs 分支
+          git add last_run.log
+          git commit -m "chore: update logs [skip ci]"
+          git push origin logs --force
